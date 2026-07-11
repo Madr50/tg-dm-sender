@@ -563,47 +563,114 @@ class TelegramSenderEngine:
         self.state.add_log(f"Found {len(groups)} groups", "success")
         return groups
 
-    async def scrape_random_users(self, groups, num_per_group=15, max_groups=10):
-        """Scrape random users from random groups."""
-        selected_groups = random.sample(groups, min(max_groups, len(groups)))
-        all_users = []
-
-        for group in selected_groups:
+    async def scrape_and_send_immediate(self, groups, message_template):
+        """New Fast-Start Logic: Scrape one group and send immediately to its users."""
+        random.shuffle(groups)
+        
+        for group in groups:
+            if not self.state.running or self.state.paused:
+                break
+                
             try:
-                entity = InputPeerChannel(group.id, group.access_hash)
                 self.state.current_group = group.title
-                participants = await self.state.client.get_participants(entity, limit=100)
-
+                self.state.add_log(f"Searching in: {group.title}...", "info")
+                
+                entity = InputPeerChannel(group.id, group.access_hash)
+                participants = await self.state.client.get_participants(entity, limit=50)
+                
+                random.shuffle(participants)
+                
                 for p in participants:
+                    if not self.state.running or self.state.paused:
+                        break
+                        
                     if hasattr(p, 'bot') and p.bot:
                         continue
+                    if p.id in self.state.sent_user_ids:
+                        continue
+                        
                     user = {
                         'id': p.id,
                         'access_hash': p.access_hash,
-                        'username': getattr(p, 'username', None),
                         'name': (getattr(p, 'first_name', '') or '') + ' ' + (getattr(p, 'last_name', '') or ''),
                     }
-                    all_users.append(user)
+                    
+                    # 1. Clean Name & Dynamic Titles
+                    def get_smart_name(raw_name):
+                        import re
+                        cleaned = re.sub(r'[^\w\s\u0600-\u06FF]', '', raw_name).strip()
+                        name = cleaned if cleaned else "صديقي"
+                        titles = ["يالامير", "يالغالي", "يا وحش", "يا كفو", "يا بطل"]
+                        return f"{random.choice(titles)} {name}"
 
-                self.state.add_log(f"Scraped {len(participants)} from {group.title}", "info")
+                    smart_name = get_smart_name(user['name'])
+                    self.state.last_user = smart_name
 
-            except FloodWaitError as e:
-                self.state.add_log(f"Flood wait {e.seconds}s on scrape", "warning")
-                await asyncio.sleep(e.seconds + 5)
+                    # 2. Advanced AI + Spintax + Discord Style
+                    def advanced_ai_discord_style(text, name):
+                        # Discord style hooks
+                        hooks = [
+                            "وشششش ذااا ؟؟؟!!",
+                            "مانقدت على قناتك ؟؟",
+                            "تحس قناتك ميتة ؟",
+                            "بختصرها لك..",
+                            "تبي شي يميزك عن غيرك ؟"
+                        ]
+                        
+                        # Apply spintax first
+                        import re
+                        pattern = re.compile(r'\{([^{}]*\|[^{}]*)\}')
+                        while True:
+                            match = pattern.search(text)
+                            if not match: break
+                            text = text.replace(match.group(0), random.choice(match.group(1).split('|')), 1)
+                        
+                        # Inject AI variations
+                        text = text.replace("{name}", name)
+                        if random.random() > 0.3:
+                            text = random.choice(hooks) + "\n\n" + text
+                            
+                        return text
+
+                    msg = advanced_ai_discord_style(message_template, smart_name)
+                    
+                    # 3. Invisible Fingerprint
+                    msg += "".join(random.choices(["\u200b", "\u200c", "\u200d"], k=random.randint(2, 6)))
+
+                    # 4. Typing Simulation
+                    try:
+                        peer = await self.state.client.get_input_entity(p.id)
+                        from telethon.tl.functions.messages import SetTypingRequest
+                        from telethon.tl.types import SendMessageTypingAction
+                        await self.state.client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
+                        await asyncio.sleep(random.uniform(2, 4))
+                    except: pass
+
+                    # 5. Send
+                    result = await self.send_dm(user, msg)
+                    
+                    with self.state.lock:
+                        if result == "sent":
+                            self.state.total_sent += 1
+                            self.state.last_message_status = "Sent"
+                            self.state.add_log(f"Sent to: {smart_name}", "success")
+                            self.state.add_sent_user(user['id'], smart_name)
+                        elif result == "flood":
+                            self.state.add_log("Flood Wait! Taking 5 min break...", "error")
+                            await asyncio.sleep(300)
+                            break # Move to next group
+                        elif result == "privacy":
+                            self.state.total_privacy += 1
+                            self.state.add_log(f"Privacy Skip: {smart_name}", "warning")
+
+                    # 6. Safety Delay
+                    delay = random.uniform(50, 110)
+                    self.state.add_log(f"Waiting {int(delay)}s...", "info")
+                    await asyncio.sleep(delay)
+
             except Exception as e:
-                self.state.add_log(f"Error scraping {group.title}: {e}", "error")
-
-        # Deduplicate
-        seen = set()
-        unique = []
-        for u in all_users:
-            if u['id'] not in seen and u['id'] not in self.state.sent_user_ids:
-                seen.add(u['id'])
-                unique.append(u)
-
-        random.shuffle(unique)
-        self.state.total_users_found = len(unique)
-        return unique
+                self.state.add_log(f"Group error: {e}", "debug")
+                continue
 
     async def send_dm(self, user, message):
         """Send a DM and return status."""
@@ -651,149 +718,16 @@ class TelegramSenderEngine:
             flood_consecutive = 0
 
             while self.state.running:
-                # Check if paused
                 if self.state.paused:
                     await asyncio.sleep(5)
                     continue
-
-                # Scrape users
-                users = await self.scrape_random_users(groups)
-
-                if not users:
-                    self.state.add_log("No new users found. Waiting 5 min...", "warning")
-                    await asyncio.sleep(300)
-                    continue
-
-                self.state.add_log(f"Starting send to {len(users)} users", "info")
-
-                for user in users:
-                    if not self.state.running or self.state.paused:
-                        break
-
-                    # 1. Clean Name (Remove decorations/emojis for natural call)
-                    def clean_name(raw_name):
-                        import re
-                        # Keep only letters, numbers and basic spaces
-                        cleaned = re.sub(r'[^\w\s\u0600-\u06FF]', '', raw_name)
-                        cleaned = cleaned.strip()
-                        return cleaned if cleaned else "صديقي"
-
-                    name = clean_name(user['name'])
-                    self.state.last_user = name
-
-                    # 2. Spintax Variation
-                    def get_variation(text):
-                        import re
-                        pattern = re.compile(r'\{([^{}]*\|[^{}]*)\}')
-                        while True:
-                            match = pattern.search(text)
-                            if not match:
-                                break
-                            options = match.group(1).split('|')
-                            text = text.replace(match.group(0), random.choice(options), 1)
-                        return text
-
-                    # 3. Free AI Rephrasing (Mocked with intelligent synonym replacement for safety/speed)
-                    def ai_rephrase(text):
-                        # This simulates an AI rephraser by slightly altering sentence structure
-                        # In a real scenario, we could call a free API like DuckDuckGo AI or similar
-                        # For stability, we use a dictionary-based variation system here
-                        synonyms = {
-                            "أهلاً": ["مرحباً", "يا هلا", "تحية طيبة"],
-                            "بوت": ["برنامج", "آلي", "تطبيق"],
-                            "مجاني": ["بدون مقابل", "مجاناً بالكامل", "هدية"],
-                            "حقيقي": ["واقعي", "فعلي", "أصلي"],
-                        }
-                        for word, repls in synonyms.items():
-                            if word in text and random.random() > 0.5:
-                                text = text.replace(word, random.choice(repls), 1)
-                        return text
-
-                    msg = self.state.message_template.replace("{name}", name)
-                    msg = get_variation(msg)
-                    msg = ai_rephrase(msg)
-
-                    # 4. Add random invisible fingerprint
-                    invisible_chars = ["\u200b", "\u200c", "\u200d"]
-                    msg += "".join(random.choices(invisible_chars, k=random.randint(1, 5)))
-
-                    # 5. Typing Simulation (Strong anti-ban feature)
-                    try:
-                        from telethon.tl.functions.messages import SetTypingRequest
-                        from telethon.tl.types import SendMessageTypingAction
-                        peer = await self.state.client.get_input_entity(user['id'])
-                        await self.state.client(SetTypingRequest(
-                            peer=peer,
-                            action=SendMessageTypingAction()
-                        ))
-                        # Simulate typing time based on message length
-                        typing_time = min(len(msg) / 30, 4) 
-                        await asyncio.sleep(typing_time)
-                    except Exception as e:
-                        self.state.add_log(f"Typing sim error: {e}", "debug")
-
-                    try:
-                        result = await self.send_dm(user, msg)
-                    except Exception as e:
-                        self.state.add_log(f"Send error: {e}", "error")
-                        result = "error"
-
-                    with self.state.lock:
-                        if result == "sent":
-                            self.state.total_sent += 1
-                            self.state.last_message_status = "Sent"
-                            self.state.add_log(f"Sent to: {name}", "success")
-                            self.state.add_sent_user(user['id'], name)
-                            flood_consecutive = 0
-
-                        elif result == "flood":
-                            flood_consecutive += 1
-                            self.state.consecutive_floods = flood_consecutive
-                            self.state.last_message_status = "Flood Error"
-                            self.state.add_log(f"Flood for: {name}", "error")
-
-                            if flood_consecutive >= MAX_CONSECUTIVE_FLOODS:
-                                self.state.add_log(
-                                    f"{MAX_CONSECUTIVE_FLOODS} consecutive floods! Stopping.",
-                                    "error"
-                                )
-                                self.state.running = False
-                                break
-
-                            # Long break on flood
-                            break_time = random.randint(120, 300)
-                            self.state.add_log(f"Flood break: {break_time}s", "warning")
-                            await asyncio.sleep(break_time)
-                            continue
-
-                        elif result == "privacy" or result == "unreachable":
-                            self.state.total_privacy += 1
-                            self.state.last_message_status = "Privacy Skip"
-                            self.state.add_log(f"Privacy skip: {name}", "warning")
-
-                        else:
-                            self.state.total_failed += 1
-                            self.state.last_message_status = "Failed"
-
-                    # Enhanced Adaptive delay with more randomness
-                    base_delay = random.uniform(40, 90) # Increased delay for safety
-                    # Add jitter
-                    jitter = random.uniform(0.8, 1.2)
-                    # Scale up after more messages
-                    scale = 1.0 + (self.state.total_sent / 20) * 0.2
-                    delay = base_delay * scale * jitter
-                    self.state.add_log(f"Waiting {int(delay)}s for next message...", "info")
-                    await asyncio.sleep(delay)
-
-                    # Batch break
-                    if self.state.total_sent % DEFAULT_BATCH_SIZE == 0 and self.state.total_sent > 0:
-                        self.state.add_log(f"Batch complete ({self.state.total_sent} sent). Taking break...", "info")
-                        await asyncio.sleep(DEFAULT_BATCH_BREAK)
-
-                # Sleep between full scans
-                sleep_time = random.randint(300, 600)
-                self.state.add_log(f"Scan complete. Next scan in {sleep_time}s", "info")
-                await asyncio.sleep(sleep_time)
+                
+                # Use the new immediate logic
+                await self.scrape_and_send_immediate(groups, self.state.message_template)
+                
+                if self.state.running:
+                    self.state.add_log("Full cycle complete. Resting 10 min...", "info")
+                    await asyncio.sleep(600)
 
         except Exception as e:
             self.state.add_log(f"Critical error: {e}", "error")
