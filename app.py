@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Telegram DM Ultra V4.2 - Based on Original V3
-- Same CreativeAI message content as original
-- Same typing simulation as original (3-6 seconds)
-- Same snipe flow as original
-- Fixed: thread-safe sent_user_ids
-- Fixed: no session WAL/SHM deletion
-- Fixed: persistent session across stop/start
-- Fixed: proper error handling (FloodWait, Privacy, etc)
+Telegram DM Ultra V5.0 - Anti-Ban Edition
+==========================================
+Features:
+  - Live Snipe (active users in groups)
+  - Strong Anti-Ban System:
+    * Adaptive Delay (starts 40-90s, scales up with each message)
+    * Batch Break (120s break every 10 messages)
+    * Flood Counter (stops after 3 consecutive floods)
+    * Typing Simulation (3-6 seconds)
+    * Message variation (invisible fingerprint)
+  - Original CreativeAI message content preserved
+  - Thread-safe state management
+  - Persistent session (no WAL/SHM deletion)
 """
 
 import os
@@ -32,13 +37,23 @@ from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser, S
 from telethon.errors import FloodWaitError, PeerFloodError, UserPrivacyRestrictedError
 
 # ============================================================
-# CONFIGURATION & LOGGING
+# CONFIGURATION
 # ============================================================
 CONFIG_FILE = "config.json"
 SESSION_SUFFIX = "_session"
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, force=True)
 logger = logging.getLogger("TelegramTool")
+
+# Anti-Ban Settings
+MAX_CONSECUTIVE_FLOODS = 3       # Stop after 3 consecutive flood errors
+DEFAULT_BATCH_SIZE = 10          # Take a break every 10 messages
+DEFAULT_BATCH_BREAK = 120        # 120 seconds break between batches
+BASE_DELAY_MIN = 40              # Minimum delay between messages
+BASE_DELAY_MAX = 90              # Maximum delay between messages
+FLOOD_SCALE = 0.2                # How much delay increases per 20 messages
+SNIPED_DELAY_MIN = 120           # Minimum delay after sniping
+SNIPED_DELAY_MAX = 300           # Maximum delay after sniping
 
 # ============================================================
 # APP STATE MANAGEMENT
@@ -52,6 +67,7 @@ class AppState:
         self.total_sent = 0
         self.total_failed = 0
         self.total_privacy = 0
+        self.consecutive_floods = 0
         self.last_user = "None"
         self.last_status = "Idle"
         self.current_group = "None"
@@ -76,7 +92,6 @@ class AppState:
 
     def save_sent_user(self, user_id):
         """Save user ID to set and persist to disk."""
-        self.sent_user_ids.add(user_id)
         try:
             with open("sent_users.json", "w") as f:
                 json.dump(list(self.sent_user_ids), f, indent=2)
@@ -102,6 +117,7 @@ class AppState:
                 "sent": self.total_sent,
                 "failed": self.total_failed,
                 "privacy": self.total_privacy,
+                "consecutive_floods": self.consecutive_floods,
                 "last_user": self.last_user,
                 "last_status": self.last_status,
                 "current_group": self.current_group,
@@ -165,26 +181,27 @@ class CreativeAI:
         body = random.choice(bodies)
         cta = random.choice(ctas)
 
-        # Add random spintax-like variations
         greetings = ["أهلاً بك", "مرحباً بك", "يا هلا والله"]
         greet = random.choice(greetings)
 
         msg = f"{hook}\n\n{greet} {final_name} 👋\n\n{body}\n\n📍 **بوت تمويل آسيا سيل**\n✅ تمويل حقيقي وسريع\n✅ تجميع نقاط بـ 3 طرق\n\n{cta}\n🔗 {invite_link}"
 
-        # Add invisible fingerprint
+        # Add invisible fingerprint (anti-ban)
         msg += "".join(random.choices(["\u200b", "\u200c", "\u200d"], k=random.randint(2, 5)))
         return msg
 
+
 # ============================================================
-# TELEGRAM CORE ENGINE (Live Snipe)
+# TELEGRAM CORE ENGINE WITH STRONG ANTI-BAN
 # ============================================================
 class TelegramEngine:
     def __init__(self, app_state):
         self.state = app_state
+        self.flood_consecutive = 0
 
     async def run(self):
         try:
-            # 1. Connect
+            # 1. Connect (reuse existing session)
             if not os.path.exists(CONFIG_FILE):
                 self.state.add_log("config.json not found!", "error")
                 return
@@ -194,7 +211,6 @@ class TelegramEngine:
 
             session_file = cfg["phone"] + SESSION_SUFFIX
 
-            # Create or reuse client (do NOT delete session files)
             if self.state.client is None:
                 self.state.client = TelegramClient(
                     session_file,
@@ -202,7 +218,6 @@ class TelegramEngine:
                     cfg["api_hash"]
                 )
 
-            # Connect
             if not self.state.client.is_connected():
                 await self.state.client.connect()
 
@@ -226,10 +241,13 @@ class TelegramEngine:
                 if not event.is_group:
                     return
 
-                # Get Sender
                 try:
                     user = await event.get_sender()
-                    if not user or user.bot or user.id in self.state.sent_user_ids:
+                    if not user or user.bot:
+                        return
+
+                    # Skip already sent users
+                    if user.id in self.state.sent_user_ids:
                         return
 
                     # ARABIC FILTER
@@ -246,46 +264,93 @@ class TelegramEngine:
                     final_msg = CreativeAI.generate_message(self.state.invite_link, full_name)
                     self.state.last_user = full_name
 
-                    # Anti-Ban Protection
+                    # ============================================================
+                    # ANTI-BAN PROTECTION
+                    # ============================================================
+
+                    # --- Typing Simulation (3-6 seconds) ---
                     try:
-                        # Typing Sim (3-6 seconds as original)
                         peer = await client.get_input_entity(user.id)
                         await client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
                         await asyncio.sleep(random.uniform(3, 6))
+                    except Exception:
+                        pass
 
-                        # Send DM
-                        await client.send_message(user, final_msg)
+                    # --- Send DM ---
+                    result = await self._send_dm(client, user, final_msg)
+
+                    # --- Handle Result ---
+                    if result == "sent":
                         with self.state.lock:
                             self.state.total_sent += 1
                             self.state.last_status = "Sent"
+                            self.state.consecutive_floods = 0
+                            self.flood_consecutive = 0
                             self.state.sent_user_ids.add(user.id)
                         self.state.save_sent_user(user.id)
                         self.state.add_log(f"Successfully sent to {full_name}", "success")
 
-                    except FloodWaitError as e:
-                        self.state.add_log(f"Flood Wait: {e.seconds}s. Stopping for safety.", "error")
-                        await asyncio.sleep(e.seconds + 10)
-                        return
-                    except UserPrivacyRestrictedError:
-                        self.state.total_privacy += 1
-                        self.state.add_log(f"Privacy skip: {full_name}", "warning")
-                    except PeerFloodError:
-                        self.state.add_log("PeerFloodError - Account restricted!", "error")
-                        await asyncio.sleep(3600)
-                    except Exception as e:
-                        if "peer" in str(e).lower():
-                            return
+                    elif result == "flood":
+                        self.flood_consecutive += 1
                         with self.state.lock:
-                            self.state.total_failed += 1
-                        self.state.add_log(f"Failed for {full_name}: {str(e)[:50]}", "error")
+                            self.state.consecutive_floods = self.flood_consecutive
+                        self.state.last_status = "Flood Error"
+                        self.state.add_log(f"Flood for: {full_name}", "error")
 
-                    # Safety Delay (60-120 seconds as original)
-                    delay = random.randint(60, 120)
-                    self.state.add_log(f"Cooling down: {delay}s...", "info")
+                        if self.flood_consecutive >= MAX_CONSECUTIVE_FLOODS:
+                            self.state.add_log(
+                                f"{MAX_CONSECUTIVE_FLOODS} consecutive floods! Stopping campaign.",
+                                "error"
+                            )
+                            self.state.running = False
+                            return
+
+                        # Long break on flood (120-300 seconds)
+                        break_time = random.randint(120, 300)
+                        self.state.add_log(f"Flood break: {break_time}s...", "warning")
+                        await asyncio.sleep(break_time)
+                        return
+
+                    elif result == "privacy" or result == "unreachable":
+                        self.state.total_privacy += 1
+                        self.state.last_status = "Privacy Skip"
+                        self.state.add_log(f"Privacy skip: {full_name}", "warning")
+
+                    else:
+                        self.state.total_failed += 1
+                        self.state.last_status = "Failed"
+                        self.state.add_log(f"Failed for {full_name}: unknown error", "error")
+
+                    # --- Adaptive Delay (Anti-Ban Core) ---
+                    # Starts at 40-90 seconds, increases after every 20 messages
+                    base_delay = random.uniform(BASE_DELAY_MIN, BASE_DELAY_MAX)
+                    jitter = random.uniform(0.8, 1.2)
+                    scale = 1.0 + (self.state.total_sent / 20) * FLOOD_SCALE
+                    delay = base_delay * scale * jitter
+
+                    self.state.add_log(f"Waiting {int(delay)}s for next message... (scale={scale:.1f}x)", "info")
                     await asyncio.sleep(delay)
 
+                    # --- Batch Break ---
+                    if self.state.total_sent % DEFAULT_BATCH_SIZE == 0 and self.state.total_sent > 0:
+                        self.state.add_log(
+                            f"Batch complete ({self.state.total_sent} sent). Taking {DEFAULT_BATCH_BREAK}s break...",
+                            "info"
+                        )
+                        await asyncio.sleep(DEFAULT_BATCH_BREAK)
+
+                except PeerFloodError:
+                    self.flood_consecutive += 1
+                    self.state.add_log("PeerFloodError - Account restricted!", "error")
+                    if self.flood_consecutive >= MAX_CONSECUTIVE_FLOODS:
+                        self.state.add_log(
+                            f"{MAX_CONSECUTIVE_FLOODS} consecutive floods! Stopping.", "error"
+                        )
+                        self.state.running = False
+                    break_time = random.randint(120, 300)
+                    await asyncio.sleep(break_time)
                 except Exception as e:
-                    pass
+                    pass  # Ignore errors silently to avoid crashing
 
             self.state.add_log("Live Snipe Engine started. Waiting for active users...", "info")
 
@@ -299,15 +364,37 @@ class TelegramEngine:
             self.state.running = False
             # DO NOT disconnect - keep session alive
 
+    async def _send_dm(self, client, user, message):
+        """Send a DM and return status."""
+        try:
+            receiver = InputPeerUser(user.id, user.access_hash)
+            await client.send_message(receiver, message)
+            return "sent"
+        except PeerFloodError:
+            return "flood"
+        except FloodWaitError as e:
+            self.state.add_log(f"FloodWaitError: {e.seconds}s", "error")
+            await asyncio.sleep(e.seconds + 5)
+            return "flood"
+        except UserPrivacyRestrictedError:
+            return "privacy"
+        except ValueError:
+            return "unreachable"
+        except Exception as e:
+            err = str(e).lower()
+            if "peer" in err or "user" in err:
+                return "unreachable"
+            return "flood"
+
 
 # ============================================================
-# WEB INTERFACE (Same as Original V3)
+# WEB INTERFACE
 # ============================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Telegram DM Ultra V4.2</title>
+    <title>Telegram DM Ultra V5.0</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
@@ -328,7 +415,7 @@ DASHBOARD_HTML = """
 <body class="p-3">
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2>Telegram DM Ultra <span class="text-info">V4.2</span></h2>
+            <h2>Telegram DM Ultra <span class="text-info">V5.0</span></h2>
             <div id="status-badge" class="status-badge bg-stopped">STOPPED</div>
         </div>
 
@@ -363,6 +450,7 @@ DASHBOARD_HTML = """
                     <div class="small">User: <span id="last-user" class="text-info">None</span></div>
                     <div class="small">Group: <span id="current-group" class="text-info">None</span></div>
                     <div class="small">Engine: <span id="last-status" class="text-info">Idle</span></div>
+                    <div class="small">Flood Errors: <span id="flood-count" class="text-warning">0</span></div>
                     <div class="small">Uptime: <span id="uptime" class="text-info">N/A</span></div>
                 </div>
             </div>
@@ -379,6 +467,7 @@ DASHBOARD_HTML = """
                 document.getElementById('last-user').innerText = data.last_user;
                 document.getElementById('current-group').innerText = data.current_group;
                 document.getElementById('last-status').innerText = data.last_status;
+                document.getElementById('flood-count').innerText = data.consecutive_floods || 0;
                 document.getElementById('uptime').innerText = data.uptime || 'N/A';
 
                 const badge = document.getElementById('status-badge');
@@ -483,6 +572,7 @@ def api_reset():
         state.total_sent = 0
         state.total_failed = 0
         state.total_privacy = 0
+        state.consecutive_floods = 0
         state.sent_user_ids.clear()
         state.last_user = "None"
         state.last_status = "Idle"
