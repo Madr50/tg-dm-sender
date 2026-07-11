@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+sent_users.json
+config.json
+*.session
+app.log
+tool.log
+watchdog.log
+.env
