@@ -721,18 +721,22 @@ class TelegramSenderEngine:
                     try:
                         from telethon.tl.functions.messages import SetTypingRequest
                         from telethon.tl.types import SendMessageTypingAction
-                        receiver = InputPeerUser(user['id'], user['access_hash'])
+                        peer = await self.state.client.get_input_entity(user['id'])
                         await self.state.client(SetTypingRequest(
-                            peer=receiver,
+                            peer=peer,
                             action=SendMessageTypingAction()
                         ))
                         # Simulate typing time based on message length
-                        typing_time = min(len(msg) / 20, 5) 
+                        typing_time = min(len(msg) / 30, 4) 
                         await asyncio.sleep(typing_time)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.state.add_log(f"Typing sim error: {e}", "debug")
 
-                    result = await self.send_dm(user, msg)
+                    try:
+                        result = await self.send_dm(user, msg)
+                    except Exception as e:
+                        self.state.add_log(f"Send error: {e}", "error")
+                        result = "error"
 
                     with self.state.lock:
                         if result == "sent":
