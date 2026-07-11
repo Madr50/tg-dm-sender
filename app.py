@@ -673,8 +673,27 @@ class TelegramSenderEngine:
                     name = user['name'].strip() or f"User-{user['id']}"
                     self.state.last_user = name
 
-                    # Build message
+                    # Build enhanced message with variations
+                    def get_variation(text):
+                        import re
+                        # Handle spintax {option1|option2|option3}
+                        pattern = re.compile(r'\{([^{}]*\|[^{}]*)\}')
+                        while True:
+                            match = pattern.search(text)
+                            if not match:
+                                break
+                            options = match.group(1).split('|')
+                            text = text.replace(match.group(0), random.choice(options), 1)
+                        return text
+
+                    # Base message with spintax support
                     msg = self.state.message_template.replace("{name}", name)
+                    msg = get_variation(msg)
+
+                    # Add random invisible fingerprint or slight variation
+                    invisible_chars = ["\u200b", "\u200c", "\u200d", " "]
+                    fingerprint = "".join(random.choices(invisible_chars, k=random.randint(1, 3)))
+                    msg += fingerprint
 
                     result = await self.send_dm(user, msg)
 
@@ -715,11 +734,14 @@ class TelegramSenderEngine:
                             self.state.total_failed += 1
                             self.state.last_message_status = "Failed"
 
-                    # Adaptive delay
-                    base_delay = random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY)
+                    # Enhanced Adaptive delay with more randomness
+                    base_delay = random.uniform(40, 90) # Increased delay for safety
+                    # Add jitter
+                    jitter = random.uniform(0.8, 1.2)
                     # Scale up after more messages
-                    scale = 1.0 + (self.state.total_sent / 50) * 0.3
-                    delay = base_delay * scale
+                    scale = 1.0 + (self.state.total_sent / 20) * 0.2
+                    delay = base_delay * scale * jitter
+                    self.state.add_log(f"Waiting {int(delay)}s for next message...", "info")
                     await asyncio.sleep(delay)
 
                     # Batch break
