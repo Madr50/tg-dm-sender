@@ -155,7 +155,14 @@ async def send_login_code_async():
     try:
         cfg = get_client_info()
         session_file = cfg["phone"] + SESSION_SUFFIX
-        client = TelegramClient(session_file, int(cfg["api_id"]), cfg["api_hash"])
+        client = TelegramClient(
+            session_file, 
+            int(cfg["api_id"]), 
+            cfg["api_hash"],
+            device_model="iPhone 13 Pro",
+            system_version="iOS 15.5",
+            app_version="8.8.2"
+        )
         await client.connect()
 
         code_hash = await client.send_code_request(cfg["phone"])
@@ -288,10 +295,16 @@ class TelegramEngine:
             session_file = cfg["phone"] + SESSION_SUFFIX
 
             if self.state.client is None:
+                # Use mobile device info to bypass PC-based bans
                 self.state.client = TelegramClient(
                     session_file,
                     int(cfg["api_id"]),
-                    cfg["api_hash"]
+                    cfg["api_hash"],
+                    device_model="iPhone 13 Pro",
+                    system_version="iOS 15.5",
+                    app_version="8.8.2",
+                    lang_code="en",
+                    system_lang_code="en-US"
                 )
 
             if not self.state.client.is_connected():
@@ -408,10 +421,78 @@ class TelegramEngine:
                 except Exception:
                     pass
 
-            self.state.add_log("Live Snipe Engine started. Waiting for active users...", "info")
+            self.state.add_log("Engine started. Fetching groups and active members...", "info")
+
+            # SCRAPE MEMBERS FROM GROUPS
+            dialogs = await client.get_dialogs()
+            groups = [d for d in dialogs if d.is_group]
+            self.state.add_log(f"Found {len(groups)} groups. Starting random member rotation...", "info")
 
             while self.state.running:
-                await asyncio.sleep(1)
+                if self.state.paused:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Pick a random group
+                group = random.choice(groups)
+                self.state.current_group = group.title
+                
+                try:
+                    # Get random members (limit to 50 per fetch for safety)
+                    members = await client.get_participants(group, limit=50)
+                    random.shuffle(members)
+                    
+                    for user in members:
+                        if not self.state.running or self.state.paused: break
+                        if user.bot or user.id in self.state.sent_user_ids: continue
+                        
+                        # Only Arabic names for better targeting
+                        full_name = (getattr(user, 'first_name', '') or '') + (getattr(user, 'last_name', '') or '')
+                        if not re.search(r'[\u0600-\u06FF]', full_name): continue
+
+                        self.state.last_user = full_name
+                        self.state.add_log(f"Targeting: {full_name} from {group.title}", "info")
+                        
+                        # Simulation
+                        try:
+                            peer = await client.get_input_entity(user.id)
+                            await client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
+                            await asyncio.sleep(random.uniform(5, 10))
+                        except: pass
+
+                        final_msg = CreativeAI.generate_message(self.state.invite_link, full_name)
+                        result = await self._send_dm(client, user, final_msg)
+
+                        if result == "sent":
+                            with self.state.lock:
+                                self.state.total_sent += 1
+                                self.state.last_status = "Sent"
+                                self.state.consecutive_floods = 0
+                                self.state.sent_user_ids.add(user.id)
+                            self.state.save_sent_user(user.id)
+                            self.state.add_log(f"Sent to {full_name}", "success")
+                        elif result == "flood":
+                            self.state.consecutive_floods += 1
+                            self.state.last_status = "Flood Error"
+                            self.state.add_log(f"Flood! Waiting {DEFAULT_BATCH_BREAK}s...", "error")
+                            await asyncio.sleep(DEFAULT_BATCH_BREAK)
+                            if self.state.consecutive_floods >= MAX_CONSECUTIVE_FLOODS:
+                                self.state.running = False
+                                break
+                        
+                        # Anti-ban delay
+                        delay = random.randint(BASE_DELAY_MIN, BASE_DELAY_MAX)
+                        await asyncio.sleep(delay)
+
+                        if self.state.total_sent % DEFAULT_BATCH_SIZE == 0:
+                            self.state.add_log(f"Batch break: {DEFAULT_BATCH_BREAK}s", "info")
+                            await asyncio.sleep(DEFAULT_BATCH_BREAK)
+
+                except Exception as e:
+                    self.state.add_log(f"Error in {group.title}: {str(e)[:50]}", "warning")
+                    await asyncio.sleep(10)
+
+                await asyncio.sleep(5)
 
         except Exception as e:
             self.state.add_log(f"Critical Engine Error: {e}", "error")
