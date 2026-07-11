@@ -31,7 +31,12 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest, SetTypingRequest
 from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser, SendMessageTypingAction
 from telethon.errors import FloodWaitError, PeerFloodError, UserPrivacyRestrictedError
-from telethon.errors import PhoneCodeError, PhoneCodeExpiredError, SessionPasswordNeededError
+try:
+    from telethon.errors import PhoneCodeError, PhoneCodeExpiredError, SessionPasswordNeededError
+except ImportError:
+    # Compatibility for different Telethon versions
+    from telethon.errors.rpcerrorlist import PhoneCodeInvalidError as PhoneCodeError
+    from telethon.errors.rpcerrorlist import PhoneCodeExpiredError, SessionPasswordNeededError
 
 # ============================================================
 # CONFIGURATION
