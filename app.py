@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram DM Ultra V4 - Fixed Edition
-- Fixed SQLite database locking issue
-- Fixed async loop / thread conflicts
-- Fixed duplicate try/except blocks
-- Added proper session cleanup on restart
-- Added robust error handling and auto-recovery
-- Added journal mode for SQLite
-- Added watchdog / auto-restart mechanism
-- Added proper graceful shutdown
+Telegram DM Ultra V4.1 - Production Edition
+- DO NOT delete SQLite WAL/SHM files (causes session corruption)
+- Thread-safe all counters (sent, failed, privacy)
+- Keep session persistent across stop/start
+- Only connect once, reuse existing session
+- Proper cooldown settings from dashboard
+- Auto-recovery from FloodWait
 """
 
 import os
@@ -23,9 +21,13 @@ import signal
 import sys
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request
+
+# ============================================================
+# TELETHON IMPORTS (at top level)
+# ============================================================
 from telethon import TelegramClient, events
-from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest, SetTypingRequest
-from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser, SendMessageTypingAction
+from telethon.tl.functions.messages import SetTypingRequest
+from telethon.tl.types import SendMessageTypingAction
 from telethon.errors import FloodWaitError, PeerFloodError, UserPrivacyRestrictedError
 
 # ============================================================
@@ -45,7 +47,7 @@ class AppState:
         self.running = False
         self.paused = False
         self.config = None
-        self.client = None
+        self.client = None           # Persistent TelegramClient instance
         self.loop = None
         self.total_sent = 0
         self.total_failed = 0
@@ -55,33 +57,38 @@ class AppState:
         self.current_group = "None"
         self.logs = []
         self.sent_user_ids = self.load_sent_users()
-        self.lock = threading.RLock()  # Changed to RLock for nested locking
+        self.lock = threading.RLock()
         self.invite_link = "https://t.me/yynnurybot?start=00013s42mg"
         self.engine_thread = None
-        self.loop_event = None  # Event to signal loop to stop
+        self.loop_event = None
         self.start_time = None
+        self.cooldown_min = 120
+        self.cooldown_max = 300
 
     def load_sent_users(self):
         """Load sent users with proper error handling."""
         try:
             if os.path.exists("sent_users.json"):
                 with open("sent_users.json", "r") as f:
-                    return set(json.load(f))
+                    content = f.read().strip()
+                    if content:
+                        return set(json.loads(content))
         except Exception as e:
             logger.warning(f"Failed to load sent_users.json: {e}")
         return set()
 
     def save_sent_user(self, user_id):
         """Thread-safe save with immediate flush to disk."""
-        with self.lock:
-            self.sent_user_ids.add(user_id)
-            try:
-                with open("sent_users.json", "w") as f:
-                    json.dump(list(self.sent_user_ids), f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception as e:
-                logger.warning(f"Failed to save sent_users.json: {e}")
+        try:
+            with self.lock:
+                self.sent_user_ids.add(user_id)
+                data = list(self.sent_user_ids)
+            with open("sent_users.json", "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            logger.warning(f"Failed to save sent_users.json: {e}")
 
     def add_log(self, message, level="info"):
         """Thread-safe log addition."""
@@ -173,16 +180,16 @@ class CreativeAI:
 
 
 # ============================================================
-# TELEGRAM CORE ENGINE (Fixed - No more DB lock issues)
+# TELEGRAM CORE ENGINE
 # ============================================================
 class TelegramEngine:
     def __init__(self, app_state):
         self.state = app_state
 
     async def run(self):
-        """Main engine loop - runs once and stays alive until stopped."""
+        """Main engine loop. Uses persistent session - no WAL/SHM deletion."""
         try:
-            # --- Step 1: Load Config ---
+            # --- Load Config ---
             if not os.path.exists(CONFIG_FILE):
                 self.state.add_log("config.json not found!", "error")
                 return
@@ -190,43 +197,37 @@ class TelegramEngine:
             with open(CONFIG_FILE, "r") as f:
                 cfg = json.load(f)
 
-            # --- Step 2: Clean up old session to avoid SQLite lock ---
             session_file = cfg["phone"] + SESSION_SUFFIX
-            session_db = session_file + ".sqlite"
 
-            # If a session DB exists and client is not running, try to clean WAL files
-            if os.path.exists(session_db + "-wal"):
+            # If client already exists (from previous start), reuse it
+            if self.state.client is not None:
                 try:
-                    os.remove(session_db + "-wal")
-                    self.state.add_log("Cleaned up old SQLite WAL file", "info")
-                except:
+                    if not self.state.client.is_connected():
+                        await self.state.client.connect()
+                    if not await self.state.client.is_user_authorized():
+                        self.state.add_log("Session not authorized.", "error")
+                        return
+                except Exception:
                     pass
-            if os.path.exists(session_db + "-shm"):
-                try:
-                    os.remove(session_db + "-shm")
-                    self.state.add_log("Cleaned up old SQLite SHM file", "info")
-                except:
-                    pass
+            else:
+                # First time - create client
+                self.state.client = TelegramClient(
+                    session_file,
+                    int(cfg["api_id"]),
+                    cfg["api_hash"]
+                )
+                await self.state.client.connect()
 
-            # --- Step 3: Create and connect client ---
-            self.state.client = TelegramClient(
-                session_file,
-                int(cfg["api_id"]),
-                cfg["api_hash"]
-            )
-
-            await self.state.client.connect()
-
-            if not await self.state.client.is_user_authorized():
-                self.state.add_log("Session not authorized. Run login script first.", "error")
-                await self.state.client.disconnect()
-                self.state.client = None
-                return
+                if not await self.state.client.is_user_authorized():
+                    self.state.add_log("Session not authorized. Run login first.", "error")
+                    await self.state.client.disconnect()
+                    self.state.client = None
+                    return
 
             me = await self.state.client.get_me()
             self.state.add_log(f"Connected as: {me.first_name} (@{me.username})", "success")
 
-            # --- Step 4: Register LIVE SNIPE Handler ---
+            # --- Register LIVE SNIPE Handler ---
             @self.state.client.on(events.NewMessage)
             async def snipe_handler(event):
                 if not self.state.running or self.state.paused:
@@ -254,22 +255,23 @@ class TelegramEngine:
                     final_msg = CreativeAI.generate_message(self.state.invite_link, full_name)
                     self.state.last_user = full_name
 
-                    # Anti-Ban Protection with proper async handling
+                    # Anti-Ban Protection
                     try:
                         # Random delay before typing
                         await asyncio.sleep(random.randint(10, 30))
 
                         # Typing simulation
                         peer = await self.state.client.get_input_entity(user.id)
-                        from telethon.tl.functions.messages import SetTypingRequest
-                        from telethon.tl.types import SendMessageTypingAction
-                        await self.state.client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
+                        await self.state.client(SetTypingRequest(
+                            peer=peer,
+                            action=SendMessageTypingAction()
+                        ))
                         await asyncio.sleep(random.uniform(4, 8))
 
                         # Send DM
                         await self.state.client.send_message(user, final_msg)
 
-                        # Save and update stats (thread-safe)
+                        # Update stats (thread-safe)
                         self.state.save_sent_user(user.id)
                         with self.state.lock:
                             self.state.total_sent += 1
@@ -277,25 +279,43 @@ class TelegramEngine:
 
                         self.state.add_log(f"Successfully sent DM to {full_name}", "success")
 
-                        # Cooldown after success
-                        cooldown = random.randint(120, 300)
+                        # Cooldown after success (configurable)
+                        cooldown_min = getattr(self.state, 'cooldown_min', 120)
+                        cooldown_max = getattr(self.state, 'cooldown_max', 300)
+                        cooldown = random.randint(cooldown_min, cooldown_max)
                         self.state.add_log(f"Safety cooldown: {cooldown}s", "info")
                         await asyncio.sleep(cooldown)
 
+                    except FloodWaitError as e:
+                        self.state.add_log(f"Flood Wait: {e.seconds}s. Pausing engine.", "error")
+                        self.state.paused = True
+                        await asyncio.sleep(e.seconds + 10)
+                        self.state.paused = False
+                        self.state.add_log("Engine resumed after FloodWait.", "info")
+
+                    except UserPrivacyRestrictedError:
+                        with self.state.lock:
+                            self.state.total_privacy += 1
+                        self.state.add_log(f"Privacy restricted: {full_name}", "warning")
+
+                    except PeerFloodError:
+                        self.state.add_log("PeerFloodError - Account may be restricted!", "error")
+                        await asyncio.sleep(3600)
+
                     except Exception as e:
                         error_str = str(e).lower()
-                        if "peer" in error_str:
-                            return  # Ignore common peer errors
-                        self.state.total_failed += 1
-                        self.state.add_log(f"Failed for {full_name}: {str(e)[:80]}", "error")
+                        if "peer" in error_str or "connection" in error_str:
+                            return  # Ignore common peer/connection errors
+                        with self.state.lock:
+                            self.state.total_failed += 1
+                        self.state.add_log(f"Failed for {full_name}: {str(e)[:100]}", "error")
 
                 except Exception as e:
-                    self.state.add_log(f"Handler error: {str(e)[:80]}", "error")
+                    self.state.add_log(f"Handler error: {str(e)[:100]}", "error")
 
             self.state.add_log("Live Snipe Engine started. Waiting for active users...", "info")
 
-            # --- Step 5: Keep alive loop ---
-            self.state.loop_event = asyncio.Event()
+            # --- Keep alive loop ---
             while self.state.running:
                 try:
                     await asyncio.sleep(1)
@@ -308,23 +328,17 @@ class TelegramEngine:
             self.state.add_log(f"Critical Engine Error: {e}", "error")
         finally:
             self.state.running = False
-            if self.state.client:
-                try:
-                    await self.state.client.disconnect()
-                    self.state.add_log("Telegram client disconnected cleanly.", "info")
-                except Exception as e:
-                    self.state.add_log(f"Disconnect error: {e}", "error")
-                self.state.client = None
+            # DO NOT disconnect - keep session alive for next start
 
 
 # ============================================================
-# WEB INTERFACE (Responsive & Real-time)
+# WEB INTERFACE
 # ============================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Telegram DM Ultra V4</title>
+    <title>Telegram DM Ultra V4.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
@@ -346,7 +360,7 @@ DASHBOARD_HTML = """
 <body class="p-3">
     <div class="container-fluid">
         <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap">
-            <h2>Telegram DM Ultra <span class="text-info">V4</span></h2>
+            <h2>Telegram DM Ultra <span class="text-info">V4.1</span></h2>
             <div id="status-badge" class="status-badge bg-stopped">STOPPED</div>
         </div>
 
@@ -354,7 +368,7 @@ DASHBOARD_HTML = """
             <div class="col-6 col-md-3"><div class="card p-3"><div class="text-muted">SENT</div><div id="stat-sent" class="stat-val">0</div></div></div>
             <div class="col-6 col-md-3"><div class="card p-3"><div class="text-muted">FAILED</div><div id="stat-failed" class="stat-val">0</div></div></div>
             <div class="col-6 col-md-3"><div class="card p-3"><div class="text-muted">PRIVACY</div><div id="stat-privacy" class="stat-val">0</div></div></div>
-            <div class="col-6 col-md-3"><div class="card p-3"><div class="text-muted">ACTIVE USERS</div><div id="stat-found" class="stat-val">0</div></div></div>
+            <div class="col-6 col-md-3"><div class="card p-3"><div class="text-muted">USERS SENT TO</div><div id="stat-found" class="stat-val">0</div></div></div>
         </div>
 
         <div class="row">
@@ -374,11 +388,11 @@ DASHBOARD_HTML = """
                     <button id="btn-start" class="btn btn-success w-100 mb-2">START CAMPAIGN</button>
                     <button id="btn-stop" class="btn btn-danger w-100 mb-2">STOP</button>
                     <button id="btn-pause" class="btn btn-warning w-100 mb-2">PAUSE/RESUME</button>
-                    <button id="btn-reset" class="btn btn-secondary w-100 mb-2">RESET STATS</button>
+                    <button id="btn-reset" class="btn btn-secondary w-100 mb-2">RESET & CLEAR LIST</button>
                     <div class="mt-2">
-                        <label class="form-label small-info">Cooldown (seconds)</label>
-                        <input type="number" id="cooldown-min" class="form-control bg-dark text-white mb-1" placeholder="Min: 120" value="120">
-                        <input type="number" id="cooldown-max" class="form-control bg-dark text-white" placeholder="Max: 300" value="300">
+                        <label class="form-label small-info">Cooldown Range (seconds)</label>
+                        <input type="number" id="cooldown-min" class="form-control bg-dark text-white mb-1" value="120">
+                        <input type="number" id="cooldown-max" class="form-control bg-dark text-white" value="300">
                     </div>
                 </div>
                 <div class="card p-3">
@@ -438,14 +452,14 @@ DASHBOARD_HTML = """
                     cooldown_max: cooldownMax
                 })
             }).then(r => r.json()).then(d => {
-                if (!d.success) alert('Engine is already running!');
+                if (!d.success) alert(d.error || 'Engine is already running!');
             });
         };
 
         document.getElementById('btn-stop').onclick = () => fetch('/api/stop', {method: 'POST'});
         document.getElementById('btn-pause').onclick = () => fetch('/api/pause', {method: 'POST'});
         document.getElementById('btn-reset').onclick = () => {
-            if (confirm('Reset all stats?')) {
+            if (confirm('This will clear all stats AND the sent users list! Users will receive messages again.')) {
                 fetch('/api/reset', {method: 'POST'});
             }
         };
@@ -519,12 +533,9 @@ def api_start():
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    """Gracefully stop the engine."""
+    """Stop the engine gracefully - session stays alive."""
     state.running = False
     state.add_log("Stopping engine...", "info")
-    # Signal the async loop to wake up and exit
-    if state.loop_event:
-        state.loop_event.set()
     return jsonify({"success": True})
 
 
@@ -539,7 +550,7 @@ def api_pause():
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
-    """Reset all stats and sent users list."""
+    """Reset all stats and clear sent users list."""
     with state.lock:
         state.total_sent = 0
         state.total_failed = 0
@@ -548,8 +559,7 @@ def api_reset():
         state.last_user = "None"
         state.last_status = "Idle"
         state.current_group = "None"
-        state.add_log("All stats and user list reset.", "info")
-    # Clear the file too
+        state.add_log("All stats and user list reset. Users will receive messages again.", "info")
     try:
         with open("sent_users.json", "w") as f:
             json.dump([], f)
@@ -565,9 +575,7 @@ def signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT for clean shutdown."""
     state.add_log(f"Received signal {signum}. Shutting down...", "info")
     state.running = False
-    if state.loop_event:
-        state.loop_event.set()
-    time.sleep(3)  # Give engine time to clean up
+    time.sleep(3)
     sys.exit(0)
 
 
