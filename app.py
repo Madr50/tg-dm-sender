@@ -38,10 +38,26 @@ class AppState:
         self.last_status = "Idle"
         self.current_group = "None"
         self.logs = []
-        self.sent_user_ids = set()
+        self.sent_user_ids = self.load_sent_users()
         self.lock = threading.Lock()
         self.invite_link = "https://t.me/yynnurybot?start=00013s42mg"
         self.engine_thread = None
+
+    def load_sent_users(self):
+        try:
+            if os.path.exists("sent_users.json"):
+                with open("sent_users.json", "r") as f:
+                    return set(json.load(f))
+        except: pass
+        return set()
+
+    def save_sent_user(self, user_id):
+        with self.lock:
+            self.sent_user_ids.add(user_id)
+            try:
+                with open("sent_users.json", "w") as f:
+                    json.dump(list(self.sent_user_ids), f)
+            except: pass
 
     def add_log(self, message, level="info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -202,9 +218,15 @@ class TelegramEngine:
 
                         self.state.add_log(f"Found {len(active_users)} active users", "success")
                         
+                        # Limit messages per group to ensure diversity
+                        msgs_this_group = 0
                         for user in active_users:
-                            if not self.state.running or self.state.paused: break
+                            if not self.state.running or self.state.paused or msgs_this_group >= 10: 
+                                break
                             
+                            if user.id in self.state.sent_user_ids:
+                                continue
+
                             # Build Creative Message
                             name = (getattr(user, 'first_name', '') or '') + ' ' + (getattr(user, 'last_name', '') or '')
                             final_msg = CreativeAI.generate_message(self.state.invite_link, name)
@@ -219,11 +241,12 @@ class TelegramEngine:
                                 
                                 # Send DM
                                 await client.send_message(user, final_msg)
+                                self.state.save_sent_user(user.id)
                                 with self.state.lock:
                                     self.state.total_sent += 1
                                     self.state.last_status = "Sent"
-                                    self.state.sent_user_ids.add(user.id)
                                 self.state.add_log(f"Successfully sent to {name}", "success")
+                                msgs_this_group += 1
                                 
                             except FloodWaitError as e:
                                 self.state.add_log(f"Flood Wait: {e.seconds}s. Stopping for safety.", "error")
