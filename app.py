@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram DM Ultra V5.0 - Anti-Ban Edition
-==========================================
+Telegram DM Ultra V5.1 - Anti-Ban Edition + Login System
+=========================================================
 Features:
   - Live Snipe (active users in groups)
-  - Strong Anti-Ban System:
-    * Adaptive Delay (starts 40-90s, scales up with each message)
-    * Batch Break (120s break every 10 messages)
-    * Flood Counter (stops after 3 consecutive floods)
-    * Typing Simulation (3-6 seconds)
-    * Message variation (invisible fingerprint)
+  - Strong Anti-Ban System (adaptive delay, batch break, flood counter)
+  - SMS Login System (via Dashboard - no CLI needed)
   - Original CreativeAI message content preserved
   - Thread-safe state management
   - Persistent session (no WAL/SHM deletion)
@@ -35,6 +31,7 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest, SetTypingRequest
 from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser, SendMessageTypingAction
 from telethon.errors import FloodWaitError, PeerFloodError, UserPrivacyRestrictedError
+from telethon.errors import PhoneCodeError, PhoneCodeExpiredError, SessionPasswordNeededError
 
 # ============================================================
 # CONFIGURATION
@@ -46,17 +43,26 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, force=True)
 logger = logging.getLogger("TelegramTool")
 
 # Anti-Ban Settings
-MAX_CONSECUTIVE_FLOODS = 3       # Stop after 3 consecutive flood errors
-DEFAULT_BATCH_SIZE = 10          # Take a break every 10 messages
-DEFAULT_BATCH_BREAK = 120        # 120 seconds break between batches
-BASE_DELAY_MIN = 40              # Minimum delay between messages
-BASE_DELAY_MAX = 90              # Maximum delay between messages
-FLOOD_SCALE = 0.2                # How much delay increases per 20 messages
-SNIPED_DELAY_MIN = 120           # Minimum delay after sniping
-SNIPED_DELAY_MAX = 300           # Maximum delay after sniping
+MAX_CONSECUTIVE_FLOODS = 3
+DEFAULT_BATCH_SIZE = 10
+DEFAULT_BATCH_BREAK = 120
+BASE_DELAY_MIN = 40
+BASE_DELAY_MAX = 90
+FLOOD_SCALE = 0.2
 
 # ============================================================
-# APP STATE MANAGEMENT
+# LOGIN STATE
+# ============================================================
+login_lock = threading.Lock()
+login_state = {
+    "status": "idle",          # idle | code_sent | verifying | authorized | error
+    "message": "",
+    "code_hash": None,
+    "phone": None,
+}
+
+# ============================================================
+# APP STATE
 # ============================================================
 class AppState:
     def __init__(self):
@@ -79,7 +85,6 @@ class AppState:
         self.start_time = None
 
     def load_sent_users(self):
-        """Load sent users with proper error handling."""
         try:
             if os.path.exists("sent_users.json"):
                 with open("sent_users.json", "r") as f:
@@ -91,7 +96,6 @@ class AppState:
         return set()
 
     def save_sent_user(self, user_id):
-        """Save user ID to set and persist to disk."""
         try:
             with open("sent_users.json", "w") as f:
                 json.dump(list(self.sent_user_ids), f, indent=2)
@@ -138,12 +142,93 @@ state = AppState()
 app = Flask(__name__)
 
 # ============================================================
+# LOGIN FUNCTIONS
+# ============================================================
+def get_client_info():
+    """Load config and return client details."""
+    with open(CONFIG_FILE, "r") as f:
+        cfg = json.load(f)
+    return cfg
+
+async def send_login_code_async():
+    """Send SMS code to user's phone."""
+    try:
+        cfg = get_client_info()
+        session_file = cfg["phone"] + SESSION_SUFFIX
+        client = TelegramClient(session_file, int(cfg["api_id"]), cfg["api_hash"])
+        await client.connect()
+
+        code_hash = await client.send_code_request(cfg["phone"])
+
+        state.client = client  # Save client for code verification
+        with login_lock:
+            login_state["status"] = "code_sent"
+            login_state["message"] = f"Code sent to {cfg['phone']}! Check Telegram or SMS."
+            login_state["code_hash"] = code_hash.phone_code_hash
+            login_state["phone"] = cfg["phone"]
+        return True
+    except Exception as e:
+        with login_lock:
+            login_state["status"] = "error"
+            login_state["message"] = f"Failed: {str(e)[:100]}"
+        return False
+
+async def verify_code_async(code, password=None):
+    """Verify the SMS code and complete login."""
+    try:
+        if state.client is None:
+            with login_lock:
+                login_state["status"] = "error"
+                login_state["message"] = "No active session. Restart login."
+            return False
+
+        await state.client.sign_in(phone=login_state["phone"], code=code)
+        me = await state.client.get_me()
+
+        with login_lock:
+            login_state["status"] = "authorized"
+            login_state["message"] = f"Logged in as: {me.first_name} (@{me.username})"
+
+        state.add_log(f"Login successful! Connected as {me.first_name}", "success")
+        state.client = state.client  # Keep client for engine
+        return True
+    except SessionPasswordNeededError:
+        try:
+            await state.client.sign_in(password=password)
+            me = await state.client.get_me()
+            with login_lock:
+                login_state["status"] = "authorized"
+                login_state["message"] = f"Logged in as: {me.first_name} (@{me.username})"
+            state.add_log(f"Login successful (with 2FA)! Connected as {me.first_name}", "success")
+            return True
+        except Exception as e2:
+            with login_lock:
+                login_state["status"] = "error"
+                login_state["message"] = f"2FA failed: {str(e2)[:100]}"
+            return False
+    except PhoneCodeExpiredError:
+        with login_lock:
+            login_state["status"] = "error"
+            login_state["message"] = "Code expired. Please request a new code."
+        return False
+    except PhoneCodeError:
+        with login_lock:
+            login_state["status"] = "error"
+            login_state["message"] = "Invalid code. Try again."
+        return False
+    except Exception as e:
+        with login_lock:
+            login_state["status"] = "error"
+            login_state["message"] = f"Error: {str(e)[:100]}"
+        return False
+
+
+# ============================================================
 # AI CREATIVE ENGINE (Exact Original Content)
 # ============================================================
 class CreativeAI:
     @staticmethod
     def generate_message(invite_link, name):
-        # 1. Dynamic Hooks (Discord Style)
         hooks = [
             "وشششش ذااا ؟؟؟!! 🤯",
             "مانقدت على قناتك ؟؟ 🤔",
@@ -153,16 +238,12 @@ class CreativeAI:
             "مليت من التكرار والتمويل الوهمي ؟ 😴",
             "قناتك محتاجة فزعة حقيقية ؟ 🚩"
         ]
-
-        # 2. Body Variations
         bodies = [
             "زيادة أعضاء قناتك بـ أعضاء حقيقيين 100% صار أسهل مما تتخيل ومجاناً بالكامل!",
             "ودك بتمويل حقيقي وتفاعل نار؟ بختصرها لك بكلمتين: بوت آسيا سيل وبس.",
             "بدل ما تدور وتتعب، هذا البوت يعطيك أعضاء حقيقيين وسرعة في التمويل خيالية.",
             "جربت كل الطرق وما نفع؟ هذا البوت مخصص لزيادة الأعضاء الحقيقيين مجاناً."
         ]
-
-        # 3. Call to Action
         ctas = [
             "لا تضيع الفرصة وشرفنا هنا:",
             "ابدأ الآن وشوف الفرق بنفسك:",
@@ -170,13 +251,11 @@ class CreativeAI:
             "خلك جزء من أقوى نظام تمويل:"
         ]
 
-        # 4. Smart Name Cleaning
         cleaned_name = re.sub(r'[^\w\s\u0600-\u06FF]', '', name).strip()
         smart_name = cleaned_name if cleaned_name else "يا بطل"
         titles = ["يالامير", "يالغالي", "يا وحش", "يا كفو", "يا بطل"]
         final_name = f"{random.choice(titles)} {smart_name}"
 
-        # 5. Assembly
         hook = random.choice(hooks)
         body = random.choice(bodies)
         cta = random.choice(ctas)
@@ -185,14 +264,12 @@ class CreativeAI:
         greet = random.choice(greetings)
 
         msg = f"{hook}\n\n{greet} {final_name} 👋\n\n{body}\n\n📍 **بوت تمويل آسيا سيل**\n✅ تمويل حقيقي وسريع\n✅ تجميع نقاط بـ 3 طرق\n\n{cta}\n🔗 {invite_link}"
-
-        # Add invisible fingerprint (anti-ban)
         msg += "".join(random.choices(["\u200b", "\u200c", "\u200d"], k=random.randint(2, 5)))
         return msg
 
 
 # ============================================================
-# TELEGRAM CORE ENGINE WITH STRONG ANTI-BAN
+# TELEGRAM CORE ENGINE WITH ANTI-BAN
 # ============================================================
 class TelegramEngine:
     def __init__(self, app_state):
@@ -201,7 +278,6 @@ class TelegramEngine:
 
     async def run(self):
         try:
-            # 1. Connect (reuse existing session)
             if not os.path.exists(CONFIG_FILE):
                 self.state.add_log("config.json not found!", "error")
                 return
@@ -222,22 +298,18 @@ class TelegramEngine:
                 await self.state.client.connect()
 
             if not await self.state.client.is_user_authorized():
-                self.state.add_log("Session not authorized. Run login script first.", "error")
-                await self.state.client.disconnect()
-                self.state.client = None
+                self.state.add_log("Not authorized! Please login via dashboard.", "error")
                 return
 
             client = self.state.client
             me = await client.get_me()
             self.state.add_log(f"Connected as: {me.first_name}", "success")
 
-            # 2. LIVE SNIPE HANDLER
+            # LIVE SNIPE HANDLER
             @client.on(events.NewMessage)
             async def handler(event):
                 if not self.state.running or self.state.paused:
                     return
-
-                # Only target groups
                 if not event.is_group:
                     return
 
@@ -245,30 +317,21 @@ class TelegramEngine:
                     user = await event.get_sender()
                     if not user or user.bot:
                         return
-
-                    # Skip already sent users
                     if user.id in self.state.sent_user_ids:
                         return
 
-                    # ARABIC FILTER
                     full_name = (getattr(user, 'first_name', '') or '') + (getattr(user, 'last_name', '') or '')
                     if not re.search(r'[\u0600-\u06FF]', full_name):
                         return
 
-                    # SNIPE!
                     group_title = (await event.get_chat()).title
                     self.state.current_group = group_title
                     self.state.add_log(f"Sniped active user in {group_title}: {full_name}", "success")
 
-                    # Build Creative Message
                     final_msg = CreativeAI.generate_message(self.state.invite_link, full_name)
                     self.state.last_user = full_name
 
-                    # ============================================================
-                    # ANTI-BAN PROTECTION
-                    # ============================================================
-
-                    # --- Typing Simulation (3-6 seconds) ---
+                    # Typing Simulation (3-6 seconds)
                     try:
                         peer = await client.get_input_entity(user.id)
                         await client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
@@ -276,10 +339,9 @@ class TelegramEngine:
                     except Exception:
                         pass
 
-                    # --- Send DM ---
+                    # Send DM
                     result = await self._send_dm(client, user, final_msg)
 
-                    # --- Handle Result ---
                     if result == "sent":
                         with self.state.lock:
                             self.state.total_sent += 1
@@ -299,13 +361,11 @@ class TelegramEngine:
 
                         if self.flood_consecutive >= MAX_CONSECUTIVE_FLOODS:
                             self.state.add_log(
-                                f"{MAX_CONSECUTIVE_FLOODS} consecutive floods! Stopping campaign.",
-                                "error"
+                                f"{MAX_CONSECUTIVE_FLOODS} consecutive floods! Stopping campaign.", "error"
                             )
                             self.state.running = False
                             return
 
-                        # Long break on flood (120-300 seconds)
                         break_time = random.randint(120, 300)
                         self.state.add_log(f"Flood break: {break_time}s...", "warning")
                         await asyncio.sleep(break_time)
@@ -321,8 +381,7 @@ class TelegramEngine:
                         self.state.last_status = "Failed"
                         self.state.add_log(f"Failed for {full_name}: unknown error", "error")
 
-                    # --- Adaptive Delay (Anti-Ban Core) ---
-                    # Starts at 40-90 seconds, increases after every 20 messages
+                    # Adaptive Delay
                     base_delay = random.uniform(BASE_DELAY_MIN, BASE_DELAY_MAX)
                     jitter = random.uniform(0.8, 1.2)
                     scale = 1.0 + (self.state.total_sent / 20) * FLOOD_SCALE
@@ -331,7 +390,7 @@ class TelegramEngine:
                     self.state.add_log(f"Waiting {int(delay)}s for next message... (scale={scale:.1f}x)", "info")
                     await asyncio.sleep(delay)
 
-                    # --- Batch Break ---
+                    # Batch Break
                     if self.state.total_sent % DEFAULT_BATCH_SIZE == 0 and self.state.total_sent > 0:
                         self.state.add_log(
                             f"Batch complete ({self.state.total_sent} sent). Taking {DEFAULT_BATCH_BREAK}s break...",
@@ -343,18 +402,14 @@ class TelegramEngine:
                     self.flood_consecutive += 1
                     self.state.add_log("PeerFloodError - Account restricted!", "error")
                     if self.flood_consecutive >= MAX_CONSECUTIVE_FLOODS:
-                        self.state.add_log(
-                            f"{MAX_CONSECUTIVE_FLOODS} consecutive floods! Stopping.", "error"
-                        )
                         self.state.running = False
                     break_time = random.randint(120, 300)
                     await asyncio.sleep(break_time)
-                except Exception as e:
-                    pass  # Ignore errors silently to avoid crashing
+                except Exception:
+                    pass
 
             self.state.add_log("Live Snipe Engine started. Waiting for active users...", "info")
 
-            # Keep the client running
             while self.state.running:
                 await asyncio.sleep(1)
 
@@ -362,10 +417,8 @@ class TelegramEngine:
             self.state.add_log(f"Critical Engine Error: {e}", "error")
         finally:
             self.state.running = False
-            # DO NOT disconnect - keep session alive
 
     async def _send_dm(self, client, user, message):
-        """Send a DM and return status."""
         try:
             receiver = InputPeerUser(user.id, user.access_hash)
             await client.send_message(receiver, message)
@@ -388,13 +441,13 @@ class TelegramEngine:
 
 
 # ============================================================
-# WEB INTERFACE
+# WEB INTERFACE WITH LOGIN PANEL
 # ============================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Telegram DM Ultra V5.0</title>
+    <title>Telegram DM Ultra V5.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
@@ -410,15 +463,40 @@ DASHBOARD_HTML = """
         .bg-running { background: #16a34a; color: white; }
         .bg-stopped { background: #dc2626; color: white; }
         .bg-warning { background: #f59e0b; color: white; }
+        .bg-authorized { background: #10b981; color: white; }
+        .bg-unauthorized { background: #ef4444; color: white; }
+        .login-panel { background: #1a1a2e; border: 2px solid #e94560; border-radius: 15px; padding: 20px; margin-bottom: 20px; }
     </style>
 </head>
 <body class="p-3">
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2>Telegram DM Ultra <span class="text-info">V5.0</span></h2>
+            <h2>Telegram DM Ultra <span class="text-info">V5.1</span></h2>
             <div id="status-badge" class="status-badge bg-stopped">STOPPED</div>
         </div>
 
+        <!-- LOGIN PANEL -->
+        <div id="login-section" class="login-panel text-center">
+            <h4>Telegram Login</h4>
+            <p id="login-message" class="text-warning">Not connected. Request a code to login.</p>
+            <div id="login-actions">
+                <button id="btn-request-code" class="btn btn-success btn-lg mb-2">Request SMS Code</button>
+            </div>
+            <div id="code-section" style="display:none;" class="mt-3">
+                <input type="text" id="code-input" class="form-control bg-dark text-white mb-2 text-center" 
+                       placeholder="Enter code from Telegram/SMS" style="font-size:1.5rem; letter-spacing:5px;">
+                <input type="password" id="password-input" class="form-control bg-dark text-white mb-2 text-center" 
+                       placeholder="2FA Password (if needed)" style="font-size:1rem;">
+                <button id="btn-verify-code" class="btn btn-primary btn-lg">Verify Code</button>
+                <button id="btn-resend-code" class="btn btn-secondary btn-lg ms-2">Resend Code</button>
+            </div>
+            <div id="authorized-section" style="display:none;" class="mt-3">
+                <p class="text-success" style="font-size:1.2rem;">Connected! You can now start campaign.</p>
+                <button id="btn-logout" class="btn btn-danger btn-lg">Logout & Reset Session</button>
+            </div>
+        </div>
+
+        <!-- STATS -->
         <div class="row text-center">
             <div class="col-md-3"><div class="card p-3"><div class="text-muted">SENT</div><div id="stat-sent" class="stat-val">0</div></div></div>
             <div class="col-md-3"><div class="card p-3"><div class="text-muted">FAILED</div><div id="stat-failed" class="stat-val">0</div></div></div>
@@ -440,10 +518,11 @@ DASHBOARD_HTML = """
                         <label class="form-label">Invite Link</label>
                         <input type="text" id="invite-link" class="form-control bg-dark text-white" value="{{ invite_link }}">
                     </div>
-                    <button id="btn-start" class="btn btn-success w-100 mb-2">START CAMPAIGN</button>
-                    <button id="btn-stop" class="btn btn-danger w-100 mb-2">STOP</button>
-                    <button id="btn-pause" class="btn btn-warning w-100 mb-2">PAUSE/RESUME</button>
+                    <button id="btn-start" class="btn btn-success w-100 mb-2" disabled>START CAMPAIGN</button>
+                    <button id="btn-stop" class="btn btn-danger w-100 mb-2" disabled>STOP</button>
+                    <button id="btn-pause" class="btn btn-warning w-100 mb-2" disabled>PAUSE/RESUME</button>
                     <button id="btn-reset" class="btn btn-secondary w-100 mb-2">RESET LIST</button>
+                    <button id="btn-logout" class="btn btn-danger w-100 mb-2">LOGOUT & DELETE SESSION</button>
                 </div>
                 <div class="card p-3">
                     <h5>Current Status</h5>
@@ -458,6 +537,48 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
+        // Auto-refresh login status
+        function updateLoginStatus() {
+            fetch('/api/login-status').then(r => r.json()).then(data => {
+                const msg = document.getElementById('login-message');
+                const actions = document.getElementById('login-actions');
+                const codeSection = document.getElementById('code-section');
+                const authSection = document.getElementById('authorized-section');
+                const startBtn = document.getElementById('btn-start');
+                const stopBtn = document.getElementById('btn-stop');
+                const pauseBtn = document.getElementById('btn-pause');
+
+                if (data.status === 'authorized') {
+                    msg.textContent = data.message;
+                    msg.className = 'text-success';
+                    actions.style.display = 'none';
+                    codeSection.style.display = 'none';
+                    authSection.style.display = 'block';
+                    startBtn.disabled = false;
+                    stopBtn.disabled = false;
+                    pauseBtn.disabled = false;
+                } else if (data.status === 'code_sent') {
+                    msg.textContent = data.message;
+                    msg.className = 'text-warning';
+                    actions.style.display = 'none';
+                    codeSection.style.display = 'block';
+                    authSection.style.display = 'none';
+                } else if (data.status === 'error') {
+                    msg.textContent = data.message;
+                    msg.className = 'text-danger';
+                    actions.style.display = 'block';
+                    codeSection.style.display = 'none';
+                    authSection.style.display = 'none';
+                } else {
+                    msg.textContent = 'Not connected. Request a code to login.';
+                    msg.className = 'text-warning';
+                    actions.style.display = 'block';
+                    codeSection.style.display = 'none';
+                    authSection.style.display = 'none';
+                }
+            });
+        }
+
         function updateStats() {
             fetch('/api/stats').then(r => r.json()).then(data => {
                 document.getElementById('stat-sent').innerText = data.sent;
@@ -491,6 +612,24 @@ DASHBOARD_HTML = """
             });
         }
 
+        document.getElementById('btn-request-code').onclick = () => {
+            fetch('/api/request-code', {method: 'POST'});
+        };
+
+        document.getElementById('btn-verify-code').onclick = () => {
+            const code = document.getElementById('code-input').value;
+            const password = document.getElementById('password-input').value;
+            fetch('/api/verify-code', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({code: code, password: password || null})
+            });
+        };
+
+        document.getElementById('btn-resend-code').onclick = () => {
+            fetch('/api/request-code', {method: 'POST'});
+        };
+
         document.getElementById('btn-start').onclick = () => {
             const link = document.getElementById('invite-link').value;
             fetch('/api/start', {
@@ -508,6 +647,13 @@ DASHBOARD_HTML = """
             }
         };
 
+        document.getElementById('btn-logout').onclick = () => {
+            if (confirm('Delete session? You will need to login again.')) {
+                fetch('/api/logout', {method: 'POST'});
+            }
+        };
+
+        setInterval(updateLoginStatus, 3000);
         setInterval(updateStats, 2000);
         setInterval(updateLogs, 2000);
     </script>
@@ -515,6 +661,9 @@ DASHBOARD_HTML = """
 </html>
 """
 
+# ============================================================
+# ROUTES
+# ============================================================
 @app.route("/")
 def dashboard():
     return render_template_string(DASHBOARD_HTML, invite_link=state.invite_link)
@@ -531,8 +680,40 @@ def api_stats():
 def api_logs():
     return jsonify({"logs": state.logs})
 
+@app.route("/api/login-status")
+def api_login_status():
+    with login_lock:
+        return jsonify(login_state)
+
+@app.route("/api/request-code", methods=["POST"])
+def api_request_code():
+    """Request SMS code to login."""
+    async def run_login():
+        await send_login_code_async()
+    asyncio.run(run_login())
+    with login_lock:
+        return jsonify(login_state)
+
+@app.route("/api/verify-code", methods=["POST"])
+def api_verify_code():
+    """Verify SMS code."""
+    data = request.json or {}
+    code = data.get("code", "").strip()
+    password = data.get("password", "").strip() or None
+
+    async def run_verify():
+        await verify_code_async(code, password)
+    asyncio.run(run_verify())
+    with login_lock:
+        return jsonify(login_state)
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
+    # Check if authorized
+    with login_lock:
+        if login_state["status"] != "authorized":
+            return jsonify({"success": False, "error": "Not authorized. Please login first."})
+
     if state.running:
         return jsonify({"success": False, "error": "Already running"})
     data = request.json or {}
@@ -583,6 +764,38 @@ def api_reset():
     except:
         pass
     return jsonify({"success": True})
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    """Logout and delete session to bypass ban."""
+    # Stop engine
+    state.running = False
+
+    # Disconnect client
+    async def disconnect():
+        if state.client and state.client.is_connected():
+            try:
+                await state.client.disconnect()
+            except:
+                pass
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(disconnect())
+    loop.close()
+    state.client = None
+
+    # Delete session files
+    session_files = [f for f in os.listdir(".") if "session" in f.lower() and (f.endswith(".sqlite") or f.endswith(".sqlite-wal") or f.endswith(".sqlite-shm") or f.endswith(".session"))]
+    for sf in session_files:
+        os.remove(sf)
+
+    # Reset login state
+    with login_lock:
+        login_state["status"] = "idle"
+        login_state["message"] = "Session deleted. Request a new code to login."
+
+    return jsonify({"success": True, "message": "Session deleted. You can now login again."})
 
 
 # ============================================================
