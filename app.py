@@ -670,13 +670,20 @@ class TelegramSenderEngine:
                     if not self.state.running or self.state.paused:
                         break
 
-                    name = user['name'].strip() or f"User-{user['id']}"
+                    # 1. Clean Name (Remove decorations/emojis for natural call)
+                    def clean_name(raw_name):
+                        import re
+                        # Keep only letters, numbers and basic spaces
+                        cleaned = re.sub(r'[^\w\s\u0600-\u06FF]', '', raw_name)
+                        cleaned = cleaned.strip()
+                        return cleaned if cleaned else "صديقي"
+
+                    name = clean_name(user['name'])
                     self.state.last_user = name
 
-                    # Build enhanced message with variations
+                    # 2. Spintax Variation
                     def get_variation(text):
                         import re
-                        # Handle spintax {option1|option2|option3}
                         pattern = re.compile(r'\{([^{}]*\|[^{}]*)\}')
                         while True:
                             match = pattern.search(text)
@@ -686,14 +693,44 @@ class TelegramSenderEngine:
                             text = text.replace(match.group(0), random.choice(options), 1)
                         return text
 
-                    # Base message with spintax support
+                    # 3. Free AI Rephrasing (Mocked with intelligent synonym replacement for safety/speed)
+                    def ai_rephrase(text):
+                        # This simulates an AI rephraser by slightly altering sentence structure
+                        # In a real scenario, we could call a free API like DuckDuckGo AI or similar
+                        # For stability, we use a dictionary-based variation system here
+                        synonyms = {
+                            "أهلاً": ["مرحباً", "يا هلا", "تحية طيبة"],
+                            "بوت": ["برنامج", "آلي", "تطبيق"],
+                            "مجاني": ["بدون مقابل", "مجاناً بالكامل", "هدية"],
+                            "حقيقي": ["واقعي", "فعلي", "أصلي"],
+                        }
+                        for word, repls in synonyms.items():
+                            if word in text and random.random() > 0.5:
+                                text = text.replace(word, random.choice(repls), 1)
+                        return text
+
                     msg = self.state.message_template.replace("{name}", name)
                     msg = get_variation(msg)
+                    msg = ai_rephrase(msg)
 
-                    # Add random invisible fingerprint or slight variation
-                    invisible_chars = ["\u200b", "\u200c", "\u200d", " "]
-                    fingerprint = "".join(random.choices(invisible_chars, k=random.randint(1, 3)))
-                    msg += fingerprint
+                    # 4. Add random invisible fingerprint
+                    invisible_chars = ["\u200b", "\u200c", "\u200d"]
+                    msg += "".join(random.choices(invisible_chars, k=random.randint(1, 5)))
+
+                    # 5. Typing Simulation (Strong anti-ban feature)
+                    try:
+                        from telethon.tl.functions.messages import SetTypingRequest
+                        from telethon.tl.types import SendMessageTypingAction
+                        receiver = InputPeerUser(user['id'], user['access_hash'])
+                        await self.state.client(SetTypingRequest(
+                            peer=receiver,
+                            action=SendMessageTypingAction()
+                        ))
+                        # Simulate typing time based on message length
+                        typing_time = min(len(msg) / 20, 5) 
+                        await asyncio.sleep(typing_time)
+                    except Exception:
+                        pass
 
                     result = await self.send_dm(user, msg)
 
