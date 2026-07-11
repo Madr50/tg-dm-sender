@@ -23,6 +23,10 @@ import signal
 import sys
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request
+from telethon import TelegramClient, events
+from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest, SetTypingRequest
+from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser, SendMessageTypingAction
+from telethon.errors import FloodWaitError, PeerFloodError, UserPrivacyRestrictedError
 
 # ============================================================
 # CONFIGURATION & LOGGING
