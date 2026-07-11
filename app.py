@@ -168,108 +168,87 @@ class TelegramEngine:
             me = await client.get_me()
             self.state.add_log(f"Connected as: {me.first_name}", "success")
 
-            # 2. Main Loop
-            while self.state.running:
-                if self.state.paused:
-                    await asyncio.sleep(5)
-                    continue
+            # 2. LIVE SNIPE HANDLER
+            @client.on(events.NewMessage)
+            async def handler(event):
+                if not self.state.running or self.state.paused:
+                    return
 
-                # Get Groups
-                self.state.add_log("Scanning groups...", "info")
-                dialogs = await client(GetDialogsRequest(
-                    offset_date=None, offset_id=0, offset_peer=InputPeerEmpty(), limit=500, hash=0
-                ))
-                groups = [c for c in dialogs.chats if hasattr(c, 'megagroup') and (c.megagroup or c.gigagroup)]
-                
-                if not groups:
-                    self.state.add_log("No groups found!", "warning")
-                    await asyncio.sleep(60)
-                    continue
+                # Only target groups
+                if not event.is_group:
+                    return
 
-                random.shuffle(groups)
-                for group in groups:
-                    if not self.state.running or self.state.paused: break
+                # Get Sender
+                try:
+                    user = await event.get_sender()
+                    if not user or user.bot or user.id in self.state.sent_user_ids:
+                        return
                     
-                    self.state.current_group = group.title
-                    self.state.add_log(f"Targeting active users in: {group.title}", "info")
+                    # ARABIC FILTER
+                    full_name = (getattr(user, 'first_name', '') or '') + (getattr(user, 'last_name', '') or '')
+                    if not re.search(r'[\u0600-\u06FF]', full_name):
+                        return
 
-                    # TARGETING ACTIVE USERS (Scrape from recent history)
+                    # SNIPE!
+                    group_title = (await event.get_chat()).title
+                    self.state.current_group = group_title
+                    self.state.add_log(f"🎯 Sniped active user in {group_title}: {full_name}", "success")
+                    
+                    # Build Creative Message
+                    final_msg = CreativeAI.generate_message(self.state.invite_link, full_name)
+                    self.state.last_user = full_name
+
+                    # Anti-Ban Protection
                     try:
-                        history = await client(GetHistoryRequest(
-                            peer=group, offset_id=0, offset_date=None, add_offset=0, limit=50, max_id=0, min_id=0, hash=0
-                        ))
+                        # Random Delay BEFORE typing to look human
+                        await asyncio.sleep(random.randint(10, 30))
                         
-                        active_users = []
-                        for msg in history.messages:
-                            if hasattr(msg, 'from_id') and msg.from_id:
-                                try:
-                                    user = await client.get_entity(msg.from_id)
-                                    if not user.bot and user.id not in self.state.sent_user_ids:
-                                        # ARABIC FILTER: Only target users with Arabic names
-                                        full_name = (getattr(user, 'first_name', '') or '') + (getattr(user, 'last_name', '') or '')
-                                        if not re.search(r'[\u0600-\u06FF]', full_name):
-                                            continue
-                                        active_users.append(user)
-                                except: continue
+                        # Typing Sim
+                        peer = await client.get_input_entity(user.id)
+                        await client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
+                        await asyncio.sleep(random.uniform(4, 8))
                         
-                        if not active_users:
-                            self.state.add_log(f"No new active users in {group.title}", "debug")
-                            continue
-
-                        self.state.add_log(f"Found {len(active_users)} active users", "success")
+                        # Send DM
+                        await client.send_message(user, final_msg)
+                        self.state.save_sent_user(user.id)
+                        with self.state.lock:
+                            self.state.total_sent += 1
+                            self.state.last_status = "Sent"
+                        self.state.add_log(f"Successfully sent DM to {full_name}", "success")
                         
-                        # Limit messages per group to ensure diversity
-                        msgs_this_group = 0
-                        for user in active_users:
-                            if not self.state.running or self.state.paused or msgs_this_group >= 10: 
-                                break
-                            
-                            if user.id in self.state.sent_user_ids:
-                                continue
-
-                            # Build Creative Message
-                            name = (getattr(user, 'first_name', '') or '') + ' ' + (getattr(user, 'last_name', '') or '')
-                            final_msg = CreativeAI.generate_message(self.state.invite_link, name)
-                            self.state.last_user = name
-
-                            # Anti-Ban Protection
-                            try:
-                                # Typing Sim
-                                peer = await client.get_input_entity(user.id)
-                                await client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
-                                await asyncio.sleep(random.uniform(3, 6))
-                                
-                                # Send DM
-                                await client.send_message(user, final_msg)
-                                self.state.save_sent_user(user.id)
-                                with self.state.lock:
-                                    self.state.total_sent += 1
-                                    self.state.last_status = "Sent"
-                                self.state.add_log(f"Successfully sent to {name}", "success")
-                                msgs_this_group += 1
-                                
-                            except FloodWaitError as e:
-                                self.state.add_log(f"Flood Wait: {e.seconds}s. Stopping for safety.", "error")
-                                await asyncio.sleep(e.seconds + 10)
-                                break
-                            except UserPrivacyRestrictedError:
-                                self.state.total_privacy += 1
-                                self.state.add_log(f"Privacy skip: {name}", "warning")
-                            except Exception as e:
-                                self.state.total_failed += 1
-                                self.state.add_log(f"Failed for {name}: {str(e)[:50]}", "error")
-
-                            # Safety Delay
-                            delay = random.randint(60, 120)
-                            self.state.add_log(f"Cooling down: {delay}s...", "info")
-                            await asyncio.sleep(delay)
-
+                        # COOL DOWN after success
+                        cooldown = random.randint(120, 300)
+                        self.state.add_log(f"Safety cooldown: {cooldown}s", "info")
+                        await asyncio.sleep(cooldown)
+                        
+                    except FloodWaitError as e:
+                        self.state.add_log(f"Flood Wait: {e.seconds}s. Pausing.", "error")
+                        self.state.paused = True
+                        await asyncio.sleep(e.seconds + 10)
+                        self.state.paused = False
+                    except UserPrivacyRestrictedError:
+                        self.state.total_privacy += 1
+                        self.state.add_log(f"Privacy restricted: {full_name}", "warning")
                     except Exception as e:
-                        self.state.add_log(f"Error in group {group.title}: {str(e)[:50]}", "debug")
-                        continue
+                        if "peer" in str(e).lower(): return # Ignore common peer errors
+                        self.state.total_failed += 1
+                        self.state.add_log(f"Failed for {full_name}: {str(e)[:50]}", "error")
 
-                self.state.add_log("Cycle complete. Resting 15 min...", "info")
-                await asyncio.sleep(900)
+                except Exception as e:
+                    pass
+
+            self.state.add_log("Live Snipe Engine started. Waiting for active users...", "info")
+            
+            # Keep the client running
+            while self.state.running:
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            self.state.add_log(f"Critical Engine Error: {e}", "error")
+        finally:
+            self.state.running = False
+            if self.state.client:
+                await self.state.client.disconnect()
 
         except Exception as e:
             self.state.add_log(f"Critical Engine Error: {e}", "error")
