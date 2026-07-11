@@ -161,7 +161,7 @@ class TelegramEngine:
                 # Get Groups
                 self.state.add_log("Scanning groups...", "info")
                 dialogs = await client(GetDialogsRequest(
-                    offset_date=None, offset_id=0, offset_peer=InputPeerEmpty(), limit=100, hash=0
+                    offset_date=None, offset_id=0, offset_peer=InputPeerEmpty(), limit=500, hash=0
                 ))
                 groups = [c for c in dialogs.chats if hasattr(c, 'megagroup') and (c.megagroup or c.gigagroup)]
                 
@@ -189,6 +189,10 @@ class TelegramEngine:
                                 try:
                                     user = await client.get_entity(msg.from_id)
                                     if not user.bot and user.id not in self.state.sent_user_ids:
+                                        # ARABIC FILTER: Only target users with Arabic names
+                                        full_name = (getattr(user, 'first_name', '') or '') + (getattr(user, 'last_name', '') or '')
+                                        if not re.search(r'[\u0600-\u06FF]', full_name):
+                                            continue
                                         active_users.append(user)
                                 except: continue
                         
